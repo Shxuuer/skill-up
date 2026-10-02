@@ -2290,6 +2290,122 @@ func TestEvaluateAll_ChecksRunnerCredentialsOnce(t *testing.T) {
 	}
 }
 
+func TestEvaluateAll_AbortsBeforeSchedulingWhenEngineUnavailable(t *testing.T) {
+	ag := &mockAgent{name: "test", output: "ok", checkErr: errors.New("agent not found in PATH")}
+	e := newTestEvaluator(EvalOptions{
+		Concurrency: 2,
+		Agent:       ag,
+		EvalCfg: &config.EvalConfig{
+			Environment: config.Environment{Type: "none"},
+		},
+	})
+
+	cases := []*config.CaseConfig{
+		{ID: "c1", Title: "Case 1", Input: config.Input{Prompt: "hello"}},
+		{ID: "c2", Title: "Case 2", Input: config.Input{Prompt: "world"}},
+	}
+
+	results, err := e.EvaluateAll(context.Background(), cases)
+	if err == nil || !strings.Contains(err.Error(), "agent not found in PATH") {
+		t.Fatalf("EvaluateAll error = %v, want engine preflight failure", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("len(results) = %d, want 0 (no case scheduled)", len(results))
+	}
+	if got := ag.runCall.Load(); got != 0 {
+		t.Fatalf("Run calls = %d, want 0", got)
+	}
+	if got := ag.checkCall.Load(); got != 1 {
+		t.Fatalf("Check calls = %d, want 1 (pre-run probe only)", got)
+	}
+	if got := ag.mcpCall.Load(); got != 0 {
+		t.Fatalf("InstallMCP calls = %d, want 0", got)
+	}
+}
+
+func TestEvaluateAll_AbortsBeforeSchedulingWhenSetupStepFails(t *testing.T) {
+	ag := &mockAgent{name: "test", output: "ok"}
+	e := newTestEvaluator(EvalOptions{
+		Concurrency: 2,
+		Agent:       ag,
+		EvalCfg: &config.EvalConfig{
+			Environment: config.Environment{
+				Type:       "none",
+				SetupSteps: []config.SetupStep{{Run: "exit 2"}},
+			},
+		},
+	})
+
+	cases := []*config.CaseConfig{
+		{ID: "c1", Title: "Case 1", Input: config.Input{Prompt: "hello"}},
+		{ID: "c2", Title: "Case 2", Input: config.Input{Prompt: "world"}},
+	}
+
+	results, err := e.EvaluateAll(context.Background(), cases)
+	if err == nil || !strings.Contains(err.Error(), "setup step 1") {
+		t.Fatalf("EvaluateAll error = %v, want setup step failure", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("len(results) = %d, want 0 (no case scheduled)", len(results))
+	}
+	if got := ag.runCall.Load(); got != 0 {
+		t.Fatalf("Run calls = %d, want 0", got)
+	}
+}
+
+func TestEvaluateAll_PreflightProbeRunsOncePerRun(t *testing.T) {
+	ag := &mockAgent{name: "test", output: "ok"}
+	e := newTestEvaluator(EvalOptions{
+		Concurrency: 2,
+		Agent:       ag,
+		EvalCfg: &config.EvalConfig{
+			Environment: config.Environment{Type: "none"},
+		},
+	})
+
+	cases := []*config.CaseConfig{
+		{ID: "c1", Title: "Case 1", Input: config.Input{Prompt: "hello"}},
+		{ID: "c2", Title: "Case 2", Input: config.Input{Prompt: "world"}},
+	}
+
+	if _, err := e.EvaluateAll(context.Background(), cases); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// One pre-run probe plus one preflight per case.
+	if got := ag.checkCall.Load(); got != 3 {
+		t.Fatalf("Check calls = %d, want 3", got)
+	}
+	if got := ag.inspectCall.Load(); got != 3 {
+		t.Fatalf("InspectRuntime calls = %d, want 3", got)
+	}
+	// The probe must not add environment installs: the "none" runtime skips
+	// agent installs in both the probe and the case path.
+	if got := ag.installCall.Load(); got != 0 {
+		t.Fatalf("Install calls = %d, want 0", got)
+	}
+}
+
+func TestEvaluateAll_PreflightProbeSkipsWhenNoTasksPlanned(t *testing.T) {
+	ag := &mockAgent{name: "test", checkErr: errors.New("agent not found in PATH")}
+	e := newTestEvaluator(EvalOptions{
+		Agent: ag,
+		EvalCfg: &config.EvalConfig{
+			Environment: config.Environment{Type: "none"},
+		},
+	})
+
+	results, err := e.EvaluatePlan(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("EvaluatePlan error = %v, want nil", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("len(results) = %d, want 0", len(results))
+	}
+	if got := ag.checkCall.Load(); got != 0 {
+		t.Fatalf("Check calls = %d, want 0 (no tasks to run)", got)
+	}
+}
+
 func TestExecuteCase_AgentJudgeReceivesTranscriptAndWorkspaceDiff(t *testing.T) {
 	workspace := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte("before\n"), 0o600); err != nil {

@@ -37,8 +37,13 @@ static and do not make a model request. The first real agent run is therefore
 the first validation of a delegated local login.
 
 Before each case, skill-up runs a static runtime preflight: the adapter's
-availability check followed by its `--version` command. With `environment.type:
-none`, the host installation is never modified; a configured concrete version
+availability check followed by its `--version` command. The same preflight also
+runs once before any case is scheduled, in a dedicated disposable runtime, so an
+unusable engine aborts the run immediately instead of executing every case and
+reporting an identical preflight error for each. The pre-run probe repeats the
+environment `setup_steps` and agent install sequence, because those steps may
+install the engine itself. With `environment.type: none`, the host installation
+is never modified; a configured concrete version
 is only validated against the host CLI. In an isolated runtime, supported npm
 adapters (`claude_code`, `codex`, `opencode`, and `qwen_code`) install the configured
 exact semantic version before the same preflight. For compatibility, tags,

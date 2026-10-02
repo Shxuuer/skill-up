@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixture uploads.
 
 ### Fixed
+- `skill-up run` now preflights the Agent Engine once before scheduling any
+  case. An unavailable engine (missing executable, failed install, version
+  mismatch) aborts the run with a single error instead of executing every case
+  and reporting the same preflight failure for each.
 - `SessionInput` no longer carries the `custom.kwargs` map. The local transport
   writes that payload into the runtime workspace, so the map was readable by
   the agent under test, bypassing the config-time rule that already rejects

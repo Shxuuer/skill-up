@@ -214,10 +214,8 @@ func (e *defaultEvaluator) EvaluatePlan(ctx context.Context, tasks []PlannedTask
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if e.ag != nil {
-		if err := e.ag.CheckCredentials(ctx); err != nil {
-			return nil, fmt.Errorf("agent credential check failed: %w", err)
-		}
+	if err := e.preflightAgent(ctx, tasks); err != nil {
+		return nil, err
 	}
 
 	results := make([]EvalResult, len(tasks))
@@ -1142,6 +1140,71 @@ func mergeFileContains(a, b []config.FileContainsCheck) []config.FileContainsChe
 	return result
 }
 
+// preflightAgent runs the one-time agent checks that gate the whole run:
+// static credential resolution, then an engine availability probe. Extracted
+// from EvaluatePlan to keep that function's cyclomatic complexity in budget.
+func (e *defaultEvaluator) preflightAgent(ctx context.Context, tasks []PlannedTask) error {
+	if e.ag == nil {
+		return nil
+	}
+	if err := e.ag.CheckCredentials(ctx); err != nil {
+		return fmt.Errorf("agent credential check failed: %w", err)
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	return e.preflightEngine(ctx)
+}
+
+// preflightEngine verifies the agent is usable in the configured runtime before
+// any case is scheduled. Without it an unusable engine (missing executable,
+// failed install, version mismatch) would only surface once per case, so the
+// run would execute every case and report the same preflight error for each.
+//
+// The probe reuses the same environment setup and agent install steps as a case
+// so it never rejects a configuration the real case path would accept. It runs
+// in a dedicated, disposable runtime and never touches case workspaces.
+func (e *defaultEvaluator) preflightEngine(ctx context.Context) error {
+	rtCfg := e.evalCfg.Environment.ToRuntimeConfig()
+	rt, err := runtime.NewRuntime(rtCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create runtime: %w", err)
+	}
+	if err := rt.Create(ctx); err != nil {
+		_ = rt.Close()
+		return fmt.Errorf("failed to create runtime workspace: %w", err)
+	}
+	defer func() { _ = rt.Close() }()
+
+	if err := e.runEnvironmentSetupSteps(ctx, rt); err != nil {
+		return err
+	}
+	if e.evalCfg.Environment.Type != "none" {
+		if err := e.ag.Install(ctx, rt); err != nil {
+			return fmt.Errorf("failed to install agent %s: %w", e.ag.Name(), err)
+		}
+	}
+	if _, err := agent.Preflight(ctx, rt, e.ag); err != nil {
+		return fmt.Errorf("agent %s check failed: %w", e.ag.Name(), err)
+	}
+	return nil
+}
+
+// runEnvironmentSetupSteps executes the environment-level setup commands shared
+// by the pre-run engine probe and every case.
+func (e *defaultEvaluator) runEnvironmentSetupSteps(ctx context.Context, rt runtime.Runtime) error {
+	for i, step := range e.evalCfg.Environment.SetupSteps {
+		result, err := rt.Exec(ctx, step.Run, runtime.ExecOptions{})
+		if err != nil {
+			return fmt.Errorf("setup step %d (%q) failed: %w", i+1, step.Run, err)
+		}
+		if result.ExitCode != 0 {
+			return fmt.Errorf("setup step %d (%q) exited with code %d: %s", i+1, step.Run, result.ExitCode, result.Stderr)
+		}
+	}
+	return nil
+}
+
 func (e *defaultEvaluator) prepareRuntimeForCase(ctx context.Context, caseCfg *config.CaseConfig, configName string, ag agent.Agent) (runtime.Runtime, agent.RuntimeObservation, error) {
 	rtCfg := e.evalCfg.Environment.ToRuntimeConfig()
 	rtCfg.Delete = e.deleteWorkspace
@@ -1169,14 +1232,8 @@ func (e *defaultEvaluator) prepareRuntimeForCase(ctx context.Context, caseCfg *c
 }
 
 func (e *defaultEvaluator) setupCaseEnvironment(ctx context.Context, rt runtime.Runtime, caseCfg *config.CaseConfig, configName string, ag agent.Agent, mcpCfg runtime.MCPConfig) (agent.RuntimeObservation, error) { //nolint:cyclop // linear setup pipeline keeps ordering and cleanup behavior explicit
-	for i, step := range e.evalCfg.Environment.SetupSteps {
-		result, err := rt.Exec(ctx, step.Run, runtime.ExecOptions{})
-		if err != nil {
-			return agent.RuntimeObservation{}, fmt.Errorf("setup step %d (%q) failed: %w", i+1, step.Run, err)
-		}
-		if result.ExitCode != 0 {
-			return agent.RuntimeObservation{}, fmt.Errorf("setup step %d (%q) exited with code %d: %s", i+1, step.Run, result.ExitCode, result.Stderr)
-		}
+	if err := e.runEnvironmentSetupSteps(ctx, rt); err != nil {
+		return agent.RuntimeObservation{}, err
 	}
 
 	if e.evalCfg.Environment.Type != "none" {
